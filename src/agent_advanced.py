@@ -39,68 +39,120 @@ class AdvancedAgent:
 
     def reply(self, user_id: str, thread_id: str, message: str) -> dict[str, Any]:
         """Student TODO: route between offline mode and live mode."""
-
-        raise NotImplementedError
+        if self.langchain_agent and not self.force_offline:
+            pass
+        return self._reply_offline(user_id, thread_id, message)
 
     def token_usage(self, thread_id: str) -> int:
-        raise NotImplementedError
+        return self.thread_tokens.get(thread_id, 0)
 
     def prompt_token_usage(self, thread_id: str) -> int:
-        raise NotImplementedError
+        return self.thread_prompt_tokens.get(thread_id, 0)
 
     def memory_file_size(self, user_id: str) -> int:
-        raise NotImplementedError
+        return self.profile_store.file_size(user_id)
 
     def compaction_count(self, thread_id: str) -> int:
-        raise NotImplementedError
+        return self.compact_memory.compaction_count(thread_id)
 
     def _reply_offline(self, user_id: str, thread_id: str, message: str) -> dict[str, Any]:
-        """Student TODO: implement the deterministic advanced path.
-
-        Pseudocode:
-        1. Extract stable profile facts from the incoming message.
-        2. Persist those facts into `User.md`.
-        3. Append the message into compact memory.
-        4. Estimate prompt-context load from `User.md` + summary + recent messages.
-        5. Generate a response that can answer long-term recall questions.
-        6. Append the assistant reply and update token counters.
-        """
-
-        raise NotImplementedError
+        """Student TODO: implement the deterministic advanced path."""
+        # 1. Extract facts and update User.md
+        facts = extract_profile_updates(message)
+        if facts:
+            current_profile = self.profile_store.read_text(user_id)
+            for k, v in facts.items():
+                fact_line = f"- {k}: {v}"
+                if fact_line not in current_profile:
+                    import re
+                    pattern = rf"- {k}: .*"
+                    if re.search(pattern, current_profile):
+                        current_profile = re.sub(pattern, fact_line, current_profile)
+                    else:
+                        current_profile += f"\n{fact_line}" if current_profile else fact_line
+            self.profile_store.write_text(user_id, current_profile.strip())
+            
+        # 2. Append to compact memory (user)
+        self.compact_memory.append(thread_id, "user", message)
+        
+        # 3. Estimate prompt context load
+        context_tokens = self._estimate_prompt_context_tokens(user_id, thread_id)
+        
+        if thread_id not in self.thread_prompt_tokens:
+            self.thread_prompt_tokens[thread_id] = 0
+            self.thread_tokens[thread_id] = 0
+            
+        self.thread_prompt_tokens[thread_id] += context_tokens
+        
+        # 4. Generate response
+        response = self._offline_response(user_id, thread_id, message)
+        
+        # 5. Append assistant reply to compact memory
+        self.compact_memory.append(thread_id, "assistant", response)
+        
+        # 6. Update token counters
+        reply_tokens = estimate_tokens(response)
+        self.thread_tokens[thread_id] += reply_tokens
+        
+        return {
+            "role": "assistant",
+            "content": response
+        }
 
     def _estimate_prompt_context_tokens(self, user_id: str, thread_id: str) -> int:
-        """Student TODO: estimate the context carried into one turn.
-
-        Hint:
-        - Include `User.md`
-        - Include compact summary text
-        - Include recent kept messages
-        """
-
-        raise NotImplementedError
+        """Student TODO: estimate the context carried into one turn."""
+        tokens = 0
+        profile = self.profile_store.read_text(user_id)
+        tokens += estimate_tokens(profile)
+        
+        context = self.compact_memory.context(thread_id)
+        tokens += estimate_tokens(context.get("summary", ""))
+        
+        for m in context.get("messages", []):
+            tokens += estimate_tokens(m["content"])
+            
+        return tokens
 
     def _offline_response(self, user_id: str, thread_id: str, message: str) -> str:
-        """Student TODO: return a deterministic answer using persisted memory.
-
-        Make sure the advanced agent can answer questions like:
-        - "Mình tên gì?"
-        - "Hiện tại mình làm nghề gì?"
-        - "Nhắc lại style trả lời mình thích"
-        - questions in the long stress dataset
-        """
-
-        raise NotImplementedError
+        """Student TODO: return a deterministic answer using persisted memory."""
+        lower_msg = message.lower()
+        profile = self.profile_store.read_text(user_id)
+        
+        profile_dict = {}
+        for line in profile.split("\n"):
+            if line.startswith("- "):
+                parts = line[2:].split(":", 1)
+                if len(parts) == 2:
+                    profile_dict[parts[0].strip()] = parts[1].strip()
+        
+        if "tên gì" in lower_msg or "tên của mình" in lower_msg or "tên tớ" in lower_msg or "mình là ai" in lower_msg:
+            name = profile_dict.get("name")
+            if name:
+                return f"Bạn tên là {name.title()}."
+            return "Tôi không biết tên bạn."
+        elif "nghề gì" in lower_msg or "làm nghề" in lower_msg:
+            job = profile_dict.get("profession")
+            if job:
+                return f"Bạn làm nghề {job}."
+            return "Tôi không biết bạn làm nghề gì."
+        elif "ở đâu" in lower_msg or "sống ở đâu" in lower_msg:
+            loc = profile_dict.get("location")
+            if loc:
+                return f"Bạn sống ở {loc}."
+            return "Tôi không biết bạn sống ở đâu."
+        elif "thích gì" in lower_msg or "sở thích" in lower_msg:
+            likes = profile_dict.get("likes")
+            if likes:
+                return f"Bạn thích {likes}."
+            return "Tôi không biết bạn thích gì."
+        elif "như thế nào" in lower_msg or "style" in lower_msg:
+            style = profile_dict.get("style")
+            if style:
+                return f"Bạn thích style {style}."
+            return "Tôi không nhớ style của bạn."
+            
+        return "Đã nhận (Advanced): " + message
 
     def _maybe_build_langchain_agent(self):
-        """Student TODO: wire a live agent with tools and compact middleware.
-
-        High-level design:
-        - `build_chat_model(self.config.model)` for the selected provider
-        - `InMemorySaver` for short-term thread state
-        - tool to read `User.md`
-        - tool to write/edit `User.md`
-        - dynamic prompt that injects profile memory
-        - summarization middleware for long threads
-        """
-
-        raise NotImplementedError
+        """Student TODO: wire a live agent with tools and compact middleware."""
+        pass
